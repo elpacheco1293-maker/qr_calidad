@@ -69,6 +69,8 @@ h1{font-size:clamp(2.2rem,7vw,3.8rem);margin:0;font-weight:800;letter-spacing:-.
 #modal.on{display:grid}
 #modal .lab{max-width:340px;width:100%;cursor:default;animation:rise .35s both}
 #modal .qr img{width:260px;height:260px}
+.row input{font:inherit;padding:10px 16px;border-radius:99px;border:1.5px solid var(--line);background:var(--card);color:var(--ink);outline:none;width:150px}
+.row input:focus{border-color:var(--p);box-shadow:0 0 0 4px var(--orb1)}
 .mh{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding-bottom:10px;border-bottom:1px solid var(--line);font-weight:800;letter-spacing:.16em}
 .mh img{width:38px;height:38px;border-radius:11px;box-shadow:0 4px 16px var(--orb1)}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
@@ -93,6 +95,8 @@ h1{font-size:clamp(2.2rem,7vw,3.8rem);margin:0;font-weight:800;letter-spacing:-.
       <input type="file" id="file" accept=".xlsx,.xls,.csv" hidden>
     </div>
     <p class="sub" id="msg">Conectando con el catálogo…</p>
+    <div class="row"><button class="btn ghost" id="lock">🔒 Administrador</button></div>
+    <div class="row" id="pinrow" hidden><input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="PIN"><button class="btn" id="pinok">Entrar</button></div>
   </section>
 
   <div class="bar" id="bar">
@@ -108,9 +112,13 @@ h1{font-size:clamp(2.2rem,7vw,3.8rem);margin:0;font-weight:800;letter-spacing:-.
 <div id="modal"></div>
 
 <script>
+/* ====== CONFIGURA AQUI (Supabase > Project Settings > API) ====== */
+const SUPABASE_URL='PEGA_AQUI_TU_PROJECT_URL';
+const SUPABASE_KEY='PEGA_AQUI_TU_ANON_KEY';
+/* ================================================================ */
 const $=s=>document.querySelector(s);
 const PAGE=48,CH=150,LS='qrc_catalog_v1',SEP='\u001f';
-let DATA=[],mode='all',shown=PAGE,cur=[],db=null,canWrite=false,busy=false,chunkIds=[];
+let DATA=[],mode='all',shown=PAGE,cur=[],PIN=null;
 const norm=s=>String(s==null?'':s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
 const mk=(c,d,u)=>({c,d,u,n:{c:norm(c),d:norm(d)}});
 const msg=t=>{$('#msg').textContent=t;};
@@ -127,36 +135,41 @@ function parse(rows){
   else{const used=[c,d,u];[0,1,2,3,4,5].forEach(i=>{if(!used.includes(i)){const k=used.indexOf(-1);if(k>=0){if(k===0)c=i;else if(k===1)d=i;else u=i;used[k]=i;}}});}
   return rows.slice(start).map(r=>mk(String(r[c]??'').trim(),String(r[d]??'').trim(),String(r[u]??'').trim())).filter(r=>r.c);
 }
+const API=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1';
+const H={apikey:SUPABASE_KEY,Authorization:'Bearer '+SUPABASE_KEY,'Content-Type':'application/json'};
+async function rpc(fn,args){
+  const r=await fetch(API+'/rpc/'+fn,{method:'POST',headers:H,body:JSON.stringify(args)});
+  if(!r.ok){let m='';try{m=(await r.json()).message;}catch(e){}throw new Error(m||('Error '+r.status));}
+  const x=await r.text();return x?JSON.parse(x):null;
+}
+async function fetchAll(){
+  const out=[];
+  for(let o=0;;o+=1000){
+    const r=await fetch(API+'/qr_catalogo?select=codigo,descripcion,unidad&order=codigo&limit=1000&offset='+o,{headers:H});
+    if(!r.ok)throw new Error('Error '+r.status);
+    const a=await r.json();a.forEach(x=>out.push(mk(x.codigo,x.descripcion||'',x.unidad||'')));
+    if(a.length<1000)break;
+  }
+  return out;
+}
+async function sync(){
+  try{DATA=await fetchAll();cacheSave();showUI();render();
+    msg(DATA.length?DATA.length+' SKU en el catálogo compartido':(PIN?'Catálogo vacío. Sube tu primer archivo.':'Aún no hay catálogo cargado.'));}
+  catch(e){msg(DATA.length?DATA.length+' SKU (copia guardada en este dispositivo)':'No pude conectar con el catálogo: '+e.message);}
+}
 async function load(file){
-  if(!canWrite||!db)return;
+  if(!PIN)return;
   try{
     const wb=/\.csv$/i.test(file.name)?XLSX.read(await file.text(),{type:'string'}):XLSX.read(await file.arrayBuffer(),{type:'array'});
     const inc=parse(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,raw:false,defval:''}));
     if(!inc.length){msg('El archivo no tiene filas con código.');return;}
-    const map=new Map(DATA.map(r=>[r.c,r]));inc.forEach(r=>map.set(r.c,r));
-    await saveAll([...map.values()],inc.length);
-  }catch(e){msg('No pude leer o guardar el archivo: '+(e&&e.message?e.message:'revisa que sea Excel o CSV.'));busy=false;}
-}
-async function saveAll(all,added){
-  busy=true;DATA=all;shown=PAGE;showUI();render();cacheSave();
-  const col=db.collection('catalog'),n=Math.ceil(all.length/CH),ids=new Set();
-  for(let i=0;i<n;i++){
-    const id='c'+String(i).padStart(4,'0');ids.add(id);
-    await col.doc(id).set({rows:all.slice(i*CH,(i+1)*CH).map(r=>[r.c,r.d,r.u].map(x=>x.split(SEP).join(' ')).join(SEP))});
-    msg('Guardando… '+Math.min((i+1)*CH,all.length)+' de '+all.length);
-  }
-  for(const id of chunkIds)if(!ids.has(id))await col.doc(id).delete();
-  chunkIds=[...ids];busy=false;
-  msg('Guardado para todos: '+all.length+' SKU en el catálogo ('+added+' del archivo).');
-}
-function applySnap(s){
-  if(busy)return;
-  chunkIds=s.docs.map(d=>d.id);
-  if(s.empty&&s.metadata.fromCache)return;
-  const rows=[];
-  [...s.docs].sort((a,b)=>a.id<b.id?-1:1).forEach(d=>(d.data().rows||[]).forEach(x=>{const p=x.split(SEP);rows.push(mk(p[0]||'',p[1]||'',p[2]||''));}));
-  DATA=rows;cacheSave();showUI();render();
-  msg(rows.length?rows.length+' SKU en el catálogo compartido':(canWrite?'Catálogo vacío. Sube tu primer archivo.':'Aún no hay catálogo cargado.'));
+    const map=new Map();inc.forEach(r=>map.set(r.c,r));const rows=[...map.values()];
+    for(let i=0;i<rows.length;i+=500){
+      await rpc('qr_guardar',{p_pin:PIN,p_rows:rows.slice(i,i+500).map(r=>({c:r.c,d:r.d,u:r.u}))});
+      msg('Guardando… '+Math.min(i+500,rows.length)+' de '+rows.length);
+    }
+    await sync();msg('Guardado para todos: '+DATA.length+' SKU en el catálogo ('+rows.length+' del archivo).');
+  }catch(e){msg('No pude guardar: '+e.message);}
 }
 function showUI(){const on=DATA.length>0;$('#bar').classList.toggle('on',on);$('#stats').classList.toggle('on',on);}
 
@@ -197,11 +210,18 @@ let armed=0;
 $('#wipe').onclick=async()=>{
   const b=$('#wipe');
   if(!armed){armed=1;b.textContent='¿Seguro? Toca otra vez';setTimeout(()=>{armed=0;b.textContent='Vaciar catálogo';},4000);return;}
-  armed=0;b.textContent='Vaciar catálogo';busy=true;
-  try{for(const id of chunkIds)await db.collection('catalog').doc(id).delete();chunkIds=[];DATA=[];cacheSave();showUI();render();msg('Catálogo vaciado.');}
+  armed=0;b.textContent='Vaciar catálogo';
+  try{await rpc('qr_vaciar',{p_pin:PIN});DATA=[];cacheSave();showUI();render();msg('Catálogo vaciado.');}
   catch(e){msg('No pude vaciar: '+e.message);}
-  busy=false;
 };
+async function tryPin(){
+  const p=$('#pin').value.trim();if(!p)return;
+  try{if(await rpc('qr_verificar',{p_pin:p})===true){PIN=p;$('#pin').value='';$('#pinrow').hidden=true;$('#lock').hidden=true;$('#drop').classList.add('ok');$('#wipe').hidden=false;msg('Modo administrador activo. Ya puedes subir tu archivo.');}
+  else msg('PIN incorrecto.');}
+  catch(e){msg('No pude verificar el PIN: '+e.message);}
+}
+$('#lock').onclick=()=>{$('#pinrow').hidden=false;$('#pin').focus();};
+$('#pinok').onclick=tryPin;$('#pin').onkeydown=e=>{if(e.key==='Enter')tryPin();};
 
 const drop=$('#drop'),file=$('#file');
 drop.onclick=()=>file.click();file.onchange=async()=>{if(file.files[0]){await load(file.files[0]);file.value='';}};
@@ -211,16 +231,8 @@ drop.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];f&&load(f);});
 
 DATA=cacheLoad();
 if(DATA.length){showUI();render();msg(DATA.length+' SKU (copia local, sincronizando…)');}
-(async()=>{
-  let u=null,d=null;
-  try{u=await claude.use('user');d=await claude.use('db');}catch(e){}
-  db=d;
-  try{canWrite=!!(db&&u&&await u.canEdit());}catch(e){}
-  if(canWrite){drop.classList.add('ok');$('#wipe').hidden=false;}
-  if(!db){msg(DATA.length?DATA.length+' SKU (copia guardada en este dispositivo)':'No se pudo abrir el catálogo compartido. Abre el link con tu sesión de Claude.');return;}
-  const tm=setTimeout(()=>{if(!DATA.length)msg('Tarda en conectar con el catálogo. Revisa tu conexión.');},10000);
-  db.collection('catalog').onSnapshot(s=>{clearTimeout(tm);applySnap(s);},e=>msg('Error de conexión: '+(e&&e.message)));
-})();
+if(SUPABASE_URL.indexOf('PEGA_AQUI')>=0){msg('Falta pegar SUPABASE_URL y SUPABASE_KEY al inicio del archivo.');}
+else{sync();document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!PIN)sync();});}
 </script>
 </body>
 </html>
